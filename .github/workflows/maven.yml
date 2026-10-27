@@ -11,8 +11,100 @@ jobs:
         env:
           JENKINS_USER: ${{ secrets.JENKINS_USER }}
           JENKINS_API_TOKEN: ${{ secrets.JENKINS_API_TOKEN }}
+          JENKINS_URL: http://127.0.0.1:8080
+          JENKINS_JOB: maven-app-checkout-build
         run: |
-          curl --fail --show-error --silent \
+          set -euo pipefail
+
+          headers="$(mktemp)"
+          trap 'rm -f "$headers"' EXIT
+
+          status="$(curl --show-error --silent \
             --user "$JENKINS_USER:$JENKINS_API_TOKEN" \
             --request POST \
-            "http://127.0.0.1:8080/job/maven-app-checkout-build/build"
+            --dump-header "$headers" \
+            --output /dev/null \
+            --write-out '%{http_code}' \
+            "$JENKINS_URL/job/$JENKINS_JOB/build")"
+
+          case "$status" in
+            2??) ;;
+            *)
+              echo "Jenkins rejected the build request (HTTP $status)." >&2
+              exit 1
+              ;;
+          esac
+
+          queue_url="$(python3 - "$headers" "$JENKINS_URL" <<'PY'
+          import sys
+          from urllib.parse import urljoin
+
+          location = ""
+          with open(sys.argv[1], encoding="utf-8") as response:
+              for line in response:
+                  if line.lower().startswith("location:"):
+                      location = line.split(":", 1)[1].strip()
+          if not location:
+              raise SystemExit("Jenkins response did not include a queue URL.")
+          print(urljoin(sys.argv[2].rstrip("/") + "/", location))
+          PY
+          )"
+
+          echo "Build queued. Waiting for Jenkins to assign a build number..."
+          started_at=$SECONDS
+          while true; do
+            queue_json="$(curl --fail --show-error --silent \
+              --user "$JENKINS_USER:$JENKINS_API_TOKEN" \
+              "$queue_url/api/json")"
+            queue_state="$(python3 -c '
+          import json, sys
+          item = json.load(sys.stdin)
+          if item.get("cancelled"):
+              print("CANCELLED")
+          else:
+              print(item.get("executable", {}).get("number", ""))
+          ' <<<"$queue_json")"
+
+            if [ "$queue_state" = "CANCELLED" ]; then
+              echo "Jenkins cancelled the queued build." >&2
+              exit 1
+            elif [ -n "$queue_state" ]; then
+              build_number="$queue_state"
+              break
+            fi
+
+            if [ "$((SECONDS - started_at))" -ge 600 ]; then
+              echo "Timed out waiting for Jenkins to start the build." >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+          build_url="$JENKINS_URL/job/$JENKINS_JOB/$build_number"
+          echo "Following Jenkins build $JENKINS_JOB #$build_number..."
+
+          while true; do
+            build_json="$(curl --fail --show-error --silent \
+              --user "$JENKINS_USER:$JENKINS_API_TOKEN" \
+              "$build_url/api/json")"
+            build_state="$(python3 -c '
+          import json, sys
+          build = json.load(sys.stdin)
+          print("{}\t{}".format(build.get("building", False), build.get("result") or ""))
+          ' <<<"$build_json")"
+            IFS="$(printf '\t')" read -r building result <<<"$build_state"
+
+            [ "$building" = "False" ] && break
+            sleep 3
+          done
+
+          echo "Jenkins console output:"
+          curl --fail --show-error --silent \
+            --user "$JENKINS_USER:$JENKINS_API_TOKEN" \
+            "$build_url/consoleText"
+          echo
+          echo "Jenkins build result: $result"
+
+          if [ "$result" != "SUCCESS" ]; then
+            exit 1
+          fi
