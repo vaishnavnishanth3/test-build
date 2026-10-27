@@ -1,4 +1,4 @@
-name: Trigger Jenkins
+name: Trigger Maven
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ jobs:
   trigger:
     runs-on: self-hosted
     steps:
-      - name: Trigger Jenkins job
+      - name: Trigger Maven job
         env:
           JENKINS_USER: ${{ secrets.JENKINS_USER }}
           JENKINS_API_TOKEN: ${{ secrets.JENKINS_API_TOKEN }}
